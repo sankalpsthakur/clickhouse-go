@@ -1,0 +1,126 @@
+name: OSS validation audit (immutable PR heads)
+
+on:
+  push:
+    branches:
+      - audit/oss-validation-20260912-chgo
+
+permissions:
+  contents: read
+
+concurrency:
+  group: oss-validation-20260912-chgo
+  cancel-in-progress: false
+
+jobs:
+  lowcardinality-2010:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+        working-directory: driver
+    env:
+      CLICKHOUSE_VERSION: 26.3.33.24
+      CLICKHOUSE_USE_DOCKER: 'true'
+      CLICKHOUSE_TEST_TIMEOUT: 1200s
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: sankalpsthakur/clickhouse-go
+          ref: f2d0b4faa3914dd78563df6453a2f7651528cd09
+          path: driver
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        id: go
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Record source and runtime
+        run: |
+          mkdir -p ../logs
+          test "$(git rev-parse HEAD)" = f2d0b4faa3914dd78563df6453a2f7651528cd09
+          { git rev-parse HEAD; go version; docker version; } 2>&1 | tee ../logs/environment.txt
+      - name: Real-server LowCardinality regression
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout 12m -v ./tests/issues -run '^TestIssue2007LowCardinalityFloats$' 2>&1 | tee ../logs/2010-integration.log
+          grep -F -- '--- PASS: TestIssue2007LowCardinalityFloats/native' ../logs/2010-integration.log
+          grep -F -- '--- PASS: TestIssue2007LowCardinalityFloats/http' ../logs/2010-integration.log
+          if grep -E 'Skipping (IT )?tests|--- SKIP:' ../logs/2010-integration.log; then exit 1; fi
+      - name: Library race tests
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
+        timeout-minutes: 10
+        run: |
+          set -o pipefail
+          go test -race -count=1 ./lib/... 2>&1 | tee ../logs/2010-lib-race.log
+      - name: Install exact lint version and run directly
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.0 2>&1 | tee ../logs/lint-install.log
+          "$(go env GOPATH)/bin/golangci-lint" version 2>&1 | tee ../logs/lint-version.log
+          "$(go env GOPATH)/bin/golangci-lint" run 2>&1 | tee ../logs/2010-lint.log
+      - name: Full repository race suite
+        if: ${{ !cancelled() && steps.go.outcome == 'success' }}
+        timeout-minutes: 25
+        run: |
+          set -o pipefail
+          make test 2>&1 | tee ../logs/2010-full-suite.log
+          if grep -E 'Skipping (IT )?tests' ../logs/2010-full-suite.log; then exit 1; fi
+          grep -E '^ok[[:space:]]+github.com/ClickHouse/clickhouse-go/v2/tests/issues' ../logs/2010-full-suite.log
+          grep -E '^ok[[:space:]]+github.com/ClickHouse/clickhouse-go/v2/tests/std' ../logs/2010-full-suite.log
+      - name: Upload raw evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chgo-2010-raw-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 7
+
+  batch-query-id-2000:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+        working-directory: driver
+    env:
+      CLICKHOUSE_VERSION: 26.3.33.24
+      CLICKHOUSE_USE_DOCKER: 'true'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: sankalpsthakur/clickhouse-go
+          ref: 98817d912f76e62c1fd1c0b9847f286796f740e1
+          path: driver
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Record source and runtime
+        run: |
+          mkdir -p ../logs
+          test "$(git rev-parse HEAD)" = 98817d912f76e62c1fd1c0b9847f286796f740e1
+          { git rev-parse HEAD; go version; docker version; } 2>&1 | tee ../logs/environment.txt
+      - name: Native HTTP and database-sql query ID regressions
+        timeout-minutes: 15
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout 12m -v ./tests/issues -run '^TestIssue1997_(Native|HTTP|Std)InsertSingleQueryID$' 2>&1 | tee ../logs/2000-integration.log
+          for protocol in Native HTTP Std; do
+            grep -F -- "--- PASS: TestIssue1997_${protocol}InsertSingleQueryID" ../logs/2000-integration.log
+          done
+          if grep -E 'Skipping (IT )?tests|--- SKIP:|system.query_log.*not available' ../logs/2000-integration.log; then exit 1; fi
+      - name: Upload raw evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: chgo-2000-raw-logs
+          path: logs/
+          if-no-files-found: warn
+          retention-days: 7
