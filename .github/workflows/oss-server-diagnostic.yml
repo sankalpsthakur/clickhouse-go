@@ -1,0 +1,80 @@
+name: ClickHouse server-only float diagnostic
+on:
+  push:
+    branches: [audit/oss-chgo-server-diagnostic-20260912]
+permissions:
+  contents: read
+jobs:
+  diagnostic:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803
+        with:
+          persist-credentials: false
+          fetch-depth: 2
+      - name: Server-only diagnostic with exact PR test configuration
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p logs
+          container="chgo-diag-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          cleanup() { docker logs "$container" > logs/server.log 2>&1 || true; docker rm -f "$container" >/dev/null 2>&1 || true; }
+          trap cleanup EXIT
+          image=clickhouse/clickhouse-server:26.3.33.24
+          docker pull "$image"
+          docker image inspect "$image" > logs/image.json
+          git rev-parse HEAD > logs/workflow-source.txt
+          git diff f2d0b4faa3914dd78563df6453a2f7651528cd09 -- tests/resources > logs/config-diff.txt
+          test ! -s logs/config-diff.txt
+          resources="$PWD/tests/resources"
+          docker run -d --name "$container" \
+            -v "$resources/custom.xml:/etc/clickhouse-server/config.d/custom.xml:ro" \
+            -v "$resources/admin.xml:/etc/clickhouse-server/users.d/admin.xml:ro" \
+            -v "$resources/clickhouse.crt:/etc/clickhouse-server/certs/clickhouse.crt:ro" \
+            -v "$resources/clickhouse.key:/etc/clickhouse-server/certs/clickhouse.key:ro" \
+            -v "$resources/CAroot.crt:/etc/clickhouse-server/certs/CAroot.crt:ro" "$image"
+          ready=false
+          for attempt in $(seq 1 60); do
+            if docker exec "$container" clickhouse-client --user tester --password ClickHouse --query 'SELECT 1' >/dev/null 2>&1; then ready=true; break; fi
+            sleep 1
+          done
+          test "$ready" = true
+          cat > logs/diagnostic.sql <<'SQL'
+          SELECT version(), currentUser();
+          SELECT name, value, changed FROM system.settings WHERE name = 'async_insert' FORMAT TSVWithNames;
+          SET allow_suspicious_low_cardinality_types=1;
+          CREATE DATABASE audit_float_bits;
+          CREATE TABLE audit_float_bits.values (
+            id UInt8,
+            plain32 Float32, plain64 Float64,
+            nullable32 Nullable(Float32), nullable64 Nullable(Float64),
+            lc32 LowCardinality(Float32), lc64 LowCardinality(Float64),
+            lcn32 LowCardinality(Nullable(Float32)), lcn64 LowCardinality(Nullable(Float64))
+          ) ENGINE = Memory;
+          SELECT number AS id,
+            reinterpretAsUInt32(reinterpretAsFloat32(if(number = 0, toUInt32(0), toUInt32(2147483648)))) AS input32,
+            reinterpretAsUInt64(reinterpretAsFloat64(if(number = 0, toUInt64(0), toUInt64('9223372036854775808')))) AS input64
+          FROM numbers(2) FORMAT TSVWithNames;
+          INSERT INTO audit_float_bits.values
+          SELECT number, f32, f64, f32, f64, f32, f64, f32, f64
+          FROM (
+            SELECT number,
+              reinterpretAsFloat32(if(number = 0, toUInt32(0), toUInt32(2147483648))) AS f32,
+              reinterpretAsFloat64(if(number = 0, toUInt64(0), toUInt64('9223372036854775808'))) AS f64
+            FROM numbers(2)
+          );
+          SELECT id,
+            reinterpretAsUInt32(plain32) AS plain32bits, reinterpretAsUInt64(plain64) AS plain64bits,
+            reinterpretAsUInt32(assumeNotNull(nullable32)) AS nullable32bits, reinterpretAsUInt64(assumeNotNull(nullable64)) AS nullable64bits,
+            reinterpretAsUInt32(lc32) AS lc32bits, reinterpretAsUInt64(lc64) AS lc64bits,
+            reinterpretAsUInt32(assumeNotNull(lcn32)) AS lcn32bits, reinterpretAsUInt64(assumeNotNull(lcn64)) AS lcn64bits
+          FROM audit_float_bits.values ORDER BY id FORMAT TSVWithNames;
+          SQL
+          docker exec -i "$container" clickhouse-client --user tester --password ClickHouse --multiquery < logs/diagnostic.sql 2>&1 | tee logs/diagnostic.log
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: chgo-server-diagnostic
+          path: logs/
+          retention-days: 7
