@@ -31,6 +31,7 @@ jobs:
           repository: sankalpsthakur/clickhouse-go
           ref: d957ab447b6c99e1a1516b51aa1d10c7f747b32b
           path: driver
+          fetch-depth: 2
           persist-credentials: false
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16
         with:
@@ -41,9 +42,27 @@ jobs:
           set -euo pipefail
           mkdir -p ../logs
           test "$(git rev-parse HEAD)" = d957ab447b6c99e1a1516b51aa1d10c7f747b32b
+          test "$(git rev-parse HEAD^)" = c37b81ff305c5fe8ab8511fb009504aec46957e0
           { git rev-parse HEAD; go version; docker version; free -m; } 2>&1 | tee ../logs/environment.txt
-          make fmt-check
-          git diff --check
+          git diff --check HEAD^ HEAD
+      - name: Require no formatting regressions against the unchanged parent
+        run: |
+          set -euo pipefail
+          git worktree add --detach ../baseline c37b81ff305c5fe8ab8511fb009504aec46957e0
+          gofmt -l . | LC_ALL=C sort > ../logs/head-formatting.txt
+          (cd ../baseline && gofmt -l .) | LC_ALL=C sort > ../logs/base-formatting.txt
+          diff -u ../logs/base-formatting.txt ../logs/head-formatting.txt
+          while IFS= read -r file; do
+            test -z "$file" && continue
+            git diff --exit-code HEAD^ HEAD -- "$file"
+          done < ../logs/head-formatting.txt
+          while IFS= read -r -d '' file; do
+            test -z "$(gofmt -l "$file")"
+          done < <(git diff --name-only --diff-filter=ACMR -z HEAD^ HEAD -- '*.go')
+          if test -s ../logs/head-formatting.txt; then
+            { echo 'Full gofmt is not green: the following unchanged parent files fail identically. No PR formatting regression.'; cat ../logs/head-formatting.txt; } | tee ../logs/formatting-limitations.txt
+          fi
+          git worktree remove ../baseline
       - name: Real-server protocol-retirement regression, ten race-enabled repetitions
         timeout-minutes: 12
         run: |
