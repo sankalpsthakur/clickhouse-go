@@ -1,0 +1,94 @@
+name: Issue 1951 heredoc binding validation
+on:
+  push:
+    branches: [validation/issue-1951-20260918]
+permissions:
+  contents: write
+jobs:
+  validate:
+    if: github.repository == 'sankalpsthakur/clickhouse-go'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CLICKHOUSE_VERSION: 26.3.33.24
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: validation
+          persist-credentials: false
+      - uses: actions/checkout@v4
+        with:
+          repository: sankalpsthakur/clickhouse-go
+          ref: 8f6263958ef3b91aba7d996025ffcf429509108d
+          path: source
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 1.25.14
+          cache-dependency-path: source/go.sum
+      - name: Prepare regression tests
+        working-directory: source
+        run: |
+          mkdir -p ../evidence
+          python3 ../validation/tools/oss-five/prepare_1951.py tests
+          git diff --check
+          go mod download
+      - name: Start ClickHouse
+        working-directory: source
+        run: make up
+      - name: Require failure before fix
+        working-directory: source
+        run: |
+          set +e
+          go test -race -count=1 -v -run '^TestBindHeredoc$' . > ../evidence/before-unit.log 2>&1
+          status=$?
+          set -e
+          cat ../evidence/before-unit.log
+          test "$status" -ne 0
+          grep -q -- '--- FAIL: TestBindHeredoc/' ../evidence/before-unit.log
+          set +e
+          go test -race -count=1 -v -run '^Test1951$' ./tests/issues > ../evidence/before-integration.log 2>&1
+          status=$?
+          set -e
+          cat ../evidence/before-integration.log
+          test "$status" -ne 0
+          grep -Eq 'have no arg for|mixed named|SYNTAX_ERROR' ../evidence/before-integration.log
+      - name: Apply fix and verify regression
+        working-directory: source
+        run: |
+          set -o pipefail
+          python3 ../validation/tools/oss-five/prepare_1951.py fix
+          go test -race -count=1 -v -run '^TestBindHeredoc$' . 2>&1 | tee ../evidence/after-unit.log
+          go test -race -count=1 -v -run '^Test1951$' ./tests/issues 2>&1 | tee ../evidence/after-integration.log
+          ! grep -q -- '--- SKIP: Test1951' ../evidence/after-integration.log
+      - name: Full race test suite
+        working-directory: source
+        run: |
+          set -o pipefail
+          make test 2>&1 | tee ../evidence/full-tests.log
+      - name: Lint without masking failures
+        working-directory: source
+        run: |
+          set -o pipefail
+          go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.0
+          golangci-lint run 2>&1 | tee ../evidence/lint.log
+          git diff --check
+      - name: Publish validated source changes
+        working-directory: source
+        run: |
+          git add bind.go bind_heredoc_test.go tests/issues/issue_1951_test.go
+          test "$(git diff --cached --name-only | wc -l)" -eq 3
+          git diff --cached --check
+          git diff --cached > ../evidence/issue-1951.patch
+          git -c user.name='Sankalp Thakur' -c user.email='31366524+sankalpsthakur@users.noreply.github.com' commit -m 'fix: preserve heredoc literals during parameter binding'
+          git push origin HEAD:refs/heads/fix/issue-1951-bind-heredoc
+          git rev-parse HEAD | tee ../evidence/commit.txt
+      - name: Stop ClickHouse
+        if: always()
+        working-directory: source
+        run: make down
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: issue-1951-evidence
+          path: evidence/
+          retention-days: 14
