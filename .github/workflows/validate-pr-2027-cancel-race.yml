@@ -1,0 +1,151 @@
+name: Validate PR 2027 cancellation race
+on:
+  push:
+    branches: [validation/pr-2027-cancel-race-20260922]
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: github.repository == 'sankalpsthakur/clickhouse-go'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CLICKHOUSE_VERSION: '25.12.11.4'
+      CLICKHOUSE_USE_DOCKER: 'true'
+      CLICKHOUSE_QUORUM_INSERT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: d957ab447b6c99e1a1516b51aa1d10c7f747b32b
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Pin base and validate resources
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pr2027-race
+          git rev-parse HEAD HEAD^{tree} HEAD^ > /tmp/pr2027-race/source.txt
+          git rev-parse HEAD^ > /tmp/pr2027-race/base.txt
+          { go version; uname -a; free -h; docker info; } > /tmp/pr2027-race/environment.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          memory = int(next(x.split()[1] for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith('MemTotal:')))
+          assert memory >= 6 * 1024 * 1024
+          PY
+          docker pull clickhouse/clickhouse-server:${CLICKHOUSE_VERSION}
+          docker image inspect clickhouse/clickhouse-server:${CLICKHOUSE_VERSION} --format '{{json .RepoDigests}}' > /tmp/pr2027-race/image-digest.txt
+      - name: Existing timeout test on the unchanged base
+        run: |
+          set -euo pipefail
+          git checkout --detach "$(cat /tmp/pr2027-race/base.txt)"
+          go test -race -p=1 -timeout=180s -count=20 ./tests/std -run '^TestStdContextStdTimeout$' > /tmp/pr2027-race/base-timeout.log 2>&1 || { tail -100 /tmp/pr2027-race/base-timeout.log; exit 1; }
+          git checkout --detach d957ab447b6c99e1a1516b51aa1d10c7f747b32b
+      - name: Reproduce the race on the unchanged PR head
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          go test -race -p=1 -timeout=180s -count=20 ./tests/std -run '^TestStdContextStdTimeout$' > /tmp/pr2027-race/before-timeout.log 2>&1
+          result=$?
+          set -e
+          tail -110 /tmp/pr2027-race/before-timeout.log
+          printf '%s\n' "$result" > /tmp/pr2027-race/before-exit.txt
+          test "$result" -ne 0
+          grep -q 'WARNING: DATA RACE' /tmp/pr2027-race/before-timeout.log
+          grep -q 'closeOnQueryError' /tmp/pr2027-race/before-timeout.log
+      - name: Correct retirement without clearing the cancelling writer buffer
+        id: correction
+        run: |
+          set -euo pipefail
+          cp conn_process.go /tmp/pr2027-race/conn_process.before.go
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('conn_process.go')
+          text = p.read_text()
+          before = '\tif closeErr := c.close(); closeErr != nil {'
+          assert text.count(before) == 1
+          after = '\t// Cancellation may still be flushing ClientCancel; leave its buffers intact.\n\tc.setClosed()\n\tif closeErr := c.conn.Close(); closeErr != nil {'
+          p.write_text(text.replace(before, after))
+          PY
+          gofmt -w conn_process.go
+          git diff --check
+          git diff --binary > /tmp/pr2027-race/fix.patch
+          cp conn_process.go /tmp/pr2027-race/conn_process.after.go
+          git diff --stat
+      - name: Existing timeout and protocol tests after correction
+        run: |
+          set -euo pipefail
+          go test -race -p=1 -timeout=180s -count=20 ./tests/std -run '^TestStdContextStdTimeout$' > /tmp/pr2027-race/after-timeout.log 2>&1 || { tail -100 /tmp/pr2027-race/after-timeout.log; exit 1; }
+          go test -race -timeout=90s -count=20 . -run '^TestQueryProtocolErrorRetiresConnection$' > /tmp/pr2027-race/after-protocol.log 2>&1 || { tail -100 /tmp/pr2027-race/after-protocol.log; exit 1; }
+      - name: Full existing race suite after correction
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          go test -race -p=1 -timeout=600s -count=1 -json ./... > /tmp/pr2027-race/tests.jsonl 2> /tmp/pr2027-race/tests.stderr
+          result=$?
+          set -e
+          printf '%s\n' "$result" > /tmp/pr2027-race/test-exit.txt
+          python3 - <<'PY'
+          import collections, json
+          from pathlib import Path
+          root = Path('/tmp/pr2027-race')
+          counts, packages, skips, failures, output = collections.Counter(), {}, [], [], []
+          for line in (root / 'tests.jsonl').read_text().splitlines():
+              event = json.loads(line)
+              action, package, test = event['Action'], event.get('Package', ''), event.get('Test')
+              if 'Output' in event: output.append(event['Output'])
+              if action in ('pass', 'fail', 'skip'):
+                  if test:
+                      counts[action] += 1
+                      if action == 'skip': skips.append({'package': package, 'test': test})
+                      if action == 'fail': failures.append({'package': package, 'test': test})
+                  else: packages[package] = action
+          text = ''.join(output)
+          (root / 'tests.log').write_text(text)
+          summary = {'source_head': 'd957ab447b6c99e1a1516b51aa1d10c7f747b32b', 'applied_patch': 'fix.patch', 'counts_include_subtests': True, 'test_results': dict(counts), 'packages': packages, 'skips': skips, 'failures': failures}
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2))
+          print(json.dumps({k: v for k, v in summary.items() if k != 'skips'}, indent=2))
+          print(text[-8000:])
+          assert 'Docker is not running' not in text
+          for suffix in ('/tests', '/tests/std', '/tests/issues'):
+              assert packages.get('github.com/ClickHouse/clickhouse-go/v2' + suffix) == 'pass', suffix
+          assert counts['pass'] > 0 and counts['fail'] == 0
+          PY
+          test "$result" -eq 0
+      - name: Record pre-existing formatting and check the changed source
+        if: always() && steps.correction.outcome == 'success'
+        run: |
+          set -euo pipefail
+          base=$(cat /tmp/pr2027-race/base.txt)
+          for file in bind_test.go examples/std/query_parameters.go; do
+            test "$(git rev-parse "$base:$file")" = "$(git rev-parse "HEAD:$file")"
+            printf '%s unchanged blob %s\n' "$file" "$(git rev-parse "HEAD:$file")" >> /tmp/pr2027-race/baseline-format.txt
+          done
+          gofmt -l . >> /tmp/pr2027-race/baseline-format.txt
+          test -z "$(gofmt -l conn_process.go conn_process_test.go tests/issues/issue_1988_test.go)"
+          git diff --check
+          test "$(git diff --name-only)" = conn_process.go
+          cmp <(git diff --binary) /tmp/pr2027-race/fix.patch
+      - name: Direct full lint
+        if: always() && steps.correction.outcome == 'success'
+        run: |
+          set -euo pipefail
+          GOBIN=/tmp/pr2027-tools go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.0 > /tmp/pr2027-race/lint-install.log 2>&1
+          /tmp/pr2027-tools/golangci-lint version > /tmp/pr2027-race/lint-version.txt
+          /tmp/pr2027-tools/golangci-lint run --timeout=5m > /tmp/pr2027-race/lint.log 2>&1 || { tail -100 /tmp/pr2027-race/lint.log; exit 1; }
+      - name: Runner diagnostics
+        if: always()
+        run: |
+          mkdir -p /tmp/pr2027-race
+          docker ps -a > /tmp/pr2027-race/docker-ps.txt 2>&1 || true
+          free -h > /tmp/pr2027-race/memory-final.txt
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr2027-cancel-race-receipts
+          path: /tmp/pr2027-race
+          retention-days: 14
