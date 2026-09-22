@@ -1,0 +1,106 @@
+name: Validate PR 2027 full race suite
+on:
+  push:
+    branches: [validation/pr-2027-full-race-20260922]
+permissions:
+  contents: read
+jobs:
+  validate:
+    if: github.repository == 'sankalpsthakur/clickhouse-go'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CLICKHOUSE_VERSION: '25.12.11.4'
+      CLICKHOUSE_USE_DOCKER: 'true'
+      CLICKHOUSE_QUORUM_INSERT: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: d957ab447b6c99e1a1516b51aa1d10c7f747b32b
+          persist-credentials: false
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.x'
+          cache: true
+      - name: Record pinned source and runner resources
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/pr2027-receipts
+          test "$(git rev-parse HEAD)" = d957ab447b6c99e1a1516b51aa1d10c7f747b32b
+          git rev-parse HEAD HEAD^{tree} > /tmp/pr2027-receipts/source.txt
+          { go version; uname -a; free -h; df -h; docker info; } > /tmp/pr2027-receipts/environment.txt
+          python3 - <<'PY'
+          from pathlib import Path
+          memory = int(next(x.split()[1] for x in Path('/proc/meminfo').read_text().splitlines() if x.startswith('MemTotal:')))
+          assert memory >= 6 * 1024 * 1024, f'Need at least 6 GiB, found {memory} KiB'
+          PY
+          docker pull clickhouse/clickhouse-server:${CLICKHOUSE_VERSION}
+          docker image inspect clickhouse/clickhouse-server:${CLICKHOUSE_VERSION} --format '{{json .RepoDigests}}' > /tmp/pr2027-receipts/image-digest.txt
+          go install -race -v . > /tmp/pr2027-receipts/install.log 2>&1
+      - name: Full existing race suite with serialized packages
+        id: suite
+        shell: bash
+        run: |
+          set -euo pipefail
+          set +e
+          go test -race -p=1 -timeout=600s -count=1 -json ./... > /tmp/pr2027-receipts/tests.jsonl 2> /tmp/pr2027-receipts/tests.stderr
+          status=$?
+          set -e
+          printf '%s\n' "$status" > /tmp/pr2027-receipts/test-exit.txt
+          python3 - <<'PY'
+          import collections, json
+          from pathlib import Path
+          root = Path('/tmp/pr2027-receipts')
+          counts = collections.Counter()
+          packages, skips, failures, output = {}, [], [], []
+          for line in (root / 'tests.jsonl').read_text().splitlines():
+              event = json.loads(line)
+              action, package, test = event['Action'], event.get('Package', ''), event.get('Test')
+              if 'Output' in event:
+                  output.append(event['Output'])
+              if action in ('pass', 'fail', 'skip'):
+                  if test:
+                      counts[action] += 1
+                      if action == 'skip': skips.append({'package': package, 'test': test})
+                      if action == 'fail': failures.append({'package': package, 'test': test})
+                  else:
+                      packages[package] = action
+          text = ''.join(output)
+          (root / 'tests.log').write_text(text)
+          summary = {'source': 'd957ab447b6c99e1a1516b51aa1d10c7f747b32b', 'command': 'go test -race -p=1 -timeout=600s -count=1 -json ./...', 'counts_include_subtests': True, 'test_results': dict(counts), 'packages': packages, 'skips': skips, 'failures': failures}
+          (root / 'summary.json').write_text(json.dumps(summary, indent=2))
+          print(json.dumps({k: v for k, v in summary.items() if k not in ('skips',)}, indent=2))
+          print(text[-12000:])
+          assert 'Docker is not running' not in text, 'Integration suite silently bypassed'
+          for suffix in ('/tests', '/tests/std', '/tests/issues'):
+              assert packages.get('github.com/ClickHouse/clickhouse-go/v2' + suffix) == 'pass', suffix
+          assert counts['pass'] > 0
+          PY
+          test "$status" -eq 0
+      - name: Formatting and direct lint
+        if: always() && steps.suite.outcome != 'skipped'
+        shell: bash
+        run: |
+          set -euo pipefail
+          make fmt-check > /tmp/pr2027-receipts/format.log 2>&1
+          GOBIN=/tmp/pr2027-tools go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.11.0 > /tmp/pr2027-receipts/lint-install.log 2>&1
+          /tmp/pr2027-tools/golangci-lint version > /tmp/pr2027-receipts/lint-version.txt
+          /tmp/pr2027-tools/golangci-lint run --timeout=5m > /tmp/pr2027-receipts/lint.log 2>&1
+          git diff --check
+          test -z "$(git status --porcelain --untracked-files=no)"
+      - name: Collect bounded runner diagnostics
+        if: always()
+        run: |
+          mkdir -p /tmp/pr2027-receipts
+          docker stats --no-stream > /tmp/pr2027-receipts/docker-stats.txt 2>&1 || true
+          docker ps -a > /tmp/pr2027-receipts/docker-ps.txt 2>&1 || true
+          free -h > /tmp/pr2027-receipts/memory-final.txt
+          for id in $(docker ps -aq --filter ancestor=clickhouse/clickhouse-server:${CLICKHOUSE_VERSION}); do
+            docker logs --tail=200 "$id" > "/tmp/pr2027-receipts/server-${id}.log" 2>&1 || true
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: pr2027-full-race-receipts
+          path: /tmp/pr2027-receipts
+          retention-days: 14
