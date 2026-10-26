@@ -100,6 +100,22 @@ func (b *batch) release(err error) {
 	}
 }
 
+// releaseAfterSend marks the batch sent and returns the connection to the pool.
+// If the watchdog already closed the connection, the original Send error is
+// preserved for the caller but the pool receives a non-nil error so the dead
+// connection is discarded.
+func (b *batch) releaseAfterSend(err error, interrupted bool) {
+	b.sent = true
+	if interrupted && err == nil {
+		if ctxErr := b.ctx.Err(); ctxErr != nil {
+			err = ctxErr
+		} else {
+			err = ErrConnectionClosed
+		}
+	}
+	b.release(err)
+}
+
 func (b *batch) Abort() error {
 	defer func() {
 		b.sent = true
@@ -202,18 +218,24 @@ func (b *batch) Column(idx int) driver.BatchColumn {
 }
 
 func (b *batch) Send() (err error) {
+	// interrupted is written by the watchdog callback and read after stopCW
+	// returns; stopCW waits for the watchdog goroutine, so the access is
+	// synchronized without an atomic.
+	interrupted := false
 	stopCW := contextWatchdog(b.ctx, func() {
 		// close TCP connection on context cancel. There is no other way simple way to interrupt underlying operations.
 		// as verified in the test, this is safe to do and cleanups resources later on
 		if b.conn != nil {
 			_ = b.conn.conn.Close()
+			interrupted = true
 		}
 	})
 
 	defer func() {
+		// stopCW must return before release: a late watchdog callback would
+		// otherwise close a connection that has already been returned to the pool.
 		stopCW()
-		b.sent = true
-		b.release(err)
+		b.releaseAfterSend(err, interrupted)
 	}()
 	if b.err != nil {
 		return b.err
