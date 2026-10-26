@@ -17,13 +17,10 @@ import (
 //
 // The watchdog goroutine exits when stop is called, or after callback returns.
 // stop blocks until that exit. After stop returns, callback has either already
-// finished or will never run: a stop that races with ctx cancellation wins, so
-// the callback is not started once stop has been called.
+// finished or will never run: if both the exit channel and ctx.Done() are
+// ready, stop wins and the callback is skipped.
 func contextWatchdog(ctx context.Context, callback func()) (stop func()) {
-	var (
-		once sync.Once
-		wg   sync.WaitGroup
-	)
+	var wg sync.WaitGroup
 	exit := make(chan struct{})
 
 	wg.Add(1)
@@ -33,15 +30,18 @@ func contextWatchdog(ctx context.Context, callback func()) (stop func()) {
 		case <-exit:
 			return
 		case <-ctx.Done():
-			once.Do(callback)
+			// Prefer stop when it races with cancellation so a connection is
+			// not closed after the caller has already released it to the pool.
+			select {
+			case <-exit:
+				return
+			default:
+				callback()
+			}
 		}
 	}()
 
 	return func() {
-		// Claim the once so a callback that has not started is skipped. If the
-		// callback is already running, this waits for it to finish.
-		// callback must not call stop: that would deadlock on sync.Once.
-		once.Do(func() {})
 		close(exit)
 		wg.Wait()
 	}
