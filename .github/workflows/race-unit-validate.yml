@@ -1,0 +1,33 @@
+name: Race unit validate
+
+# Fork-only validation for the fix-1988 branches. Not part of any upstream PR.
+on:
+  push:
+    branches:
+      - ci-validate-2027
+      - ci-validate-2027-failbefore
+  workflow_dispatch:
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go:
+          - "1.27"
+          - "1.26"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Go ${{ matrix.go }}
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Race unit tests
+        env:
+          GOTOOLCHAIN: "local"
+        run: |
+          go test -race -count=5 -v -run 'TestQueryDeadlineRetiresConnectionWithoutRace|TestQueryProtocolErrorRetiresConnection' .
