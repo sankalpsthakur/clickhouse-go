@@ -31,3 +31,21 @@ jobs:
           GOTOOLCHAIN: "local"
         run: |
           go test -race -count=5 -v -run 'TestQueryDeadlineRetiresConnectionWithoutRace|TestQueryProtocolErrorRetiresConnection' .
+
+  lint:
+    # Upstream lint runs on a self-hosted runner, so repeat it here with the same version.
+    if: github.ref_name == 'ci-validate-2027'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.11
